@@ -1,7 +1,7 @@
 from fastapi import FastAPI
-from fastapi.encoders import jsonable_encoder
 import pandas as pd
 import numpy as np
+import json
 
 from engine import find_similar, backtest
 
@@ -19,31 +19,6 @@ def meta():
     leagues = sorted(df["Div"].dropna().astype(str).unique().tolist()) if "Div" in df.columns else []
     return {"teams": teams, "leagues": leagues}
 
-def clean_for_json(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.copy()
-
-    # Tarih varsa ISO string yap
-    if "Date" in out.columns:
-        out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-
-    # NaN/Inf -> None
-    out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.where(pd.notnull(out), None)
-
-    return out
-
-def clean_dict_for_json(d):
-    # dict içindeki NaN/Inf varsa temizle
-    def fix(x):
-        if isinstance(x, float) and (np.isnan(x) or np.isinf(x)):
-            return None
-        if isinstance(x, dict):
-            return {k: fix(v) for k, v in x.items()}
-        if isinstance(x, list):
-            return [fix(v) for v in x]
-        return x
-    return fix(d)
-
 @app.post("/analyze")
 def analyze(payload: dict):
     ch = float(payload["ch"])
@@ -53,13 +28,31 @@ def analyze(payload: dict):
     limit = int(payload.get("limit", 50))
 
     similar = find_similar(df, ch, cd, ca, topk=topk)
-
     bt = backtest(similar)
-    bt = clean_dict_for_json(bt)
 
-    out = clean_for_json(similar.head(limit))
-    matches = out.to_dict(orient="records")
+    # ✅ Matches: NaN/Inf temizliği + JSON-safe dönüşüm (en sağlam yöntem)
+    out = similar.head(limit).copy()
 
-    # ✅ En sağlam JSON encoder (datetime/Decimal/np types hepsini çözer)
-    response = {"matches": matches, "backtest": bt}
-    return jsonable_encoder(response)
+    # inf -> nan
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    # Date varsa ISO string
+    if "Date" in out.columns:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+
+    # pandas to_json NaN -> null yapar, sonra json.loads ile listeye çeviriyoruz
+    matches = json.loads(out.to_json(orient="records", date_format="iso"))
+
+    # ✅ Backtest içinde NaN varsa None yap
+    def fix_nan(x):
+        if isinstance(x, float) and (np.isnan(x) or np.isinf(x)):
+            return None
+        if isinstance(x, dict):
+            return {k: fix_nan(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [fix_nan(v) for v in x]
+        return x
+
+    bt = fix_nan(bt)
+
+    return {"matches": matches, "backtest": bt}
